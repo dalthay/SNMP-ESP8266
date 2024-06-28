@@ -37,8 +37,8 @@ int temperaturaInt;
 int buttonStatus;
 int command;   // Variável para armazenar o estado do botão
 
-const char* ssid = "J3WIFI-2.4G";
-const char* password = "familiag";
+const char* ssid = "";
+const char* password = "";
 
 WiFiUDP udp;
 // Starts an SMMPAgent instance with the read-only community string 'public', and read-write community string 'private'
