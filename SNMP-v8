@@ -1,0 +1,250 @@
+//Desenvolvido por José Dalthay de Lima - dalthayjd@hotmail.com
+//v5 implementado leitura do estado do botão na porta D1//
+//v6 servidor web com estado do botao e do led
+//v7 adicionado um novo OID para o status do botão
+//v8 adicionado script para ligar/desligar led via snmp - ponteiro
+
+
+#if defined (ESP8266)
+    #include <ESP8266WiFi.h>        // ESP8266 Core WiFi Library         
+    #include <ESP8266WebServer.h>   // Biblioteca para criar um servidor web no ESP8266
+#else
+    #include <WiFi.h>               // ESP32 Core WiFi Library    
+    #include <WebServer.h>          // Biblioteca para criar um servidor web no ESP32
+#endif
+
+#include <WiFiUdp.h>
+#include <SNMP_Agent.h>
+#include <SNMPTrap.h>
+#include <DHT.h>
+
+#if defined (ESP8266)
+ESP8266WebServer server(80);  // Cria uma instância do servidor web na porta 80 para ESP8266
+#else
+WebServer server(80);  // Cria uma instância do servidor web na porta 80 para ESP32
+#endif
+
+#define DHTPIN 2  // Pino digital D2 (GPIO4) conectado ao DHT11
+#define DHTTYPE DHT11
+#define BUTTON_PIN 5  // Pino digital conectado ao botão push-pull
+#define LED_PIN 4  // Define o pino do LED como GPIO 5 (D2 no ESP8266)
+
+DHT dht(DHTPIN, DHTTYPE);  // Inicializando o objeto dht do tipo DHT passando como parâmetro o pino (DHTPIN) e o tipo do sensor (DHTTYPE)
+
+float temperatura;  // Variável para armazenar a temperatura
+float umidade;      // Variável para armazenar a umidade
+int temperaturaInt;
+int buttonStatus;
+int command;   // Variável para armazenar o estado do botão
+
+const char* ssid = "J3WIFI-2.4G";
+const char* password = "familiag";
+
+WiFiUDP udp;
+// Starts an SMMPAgent instance with the read-only community string 'public', and read-write community string 'private'
+SNMPAgent snmp("public", "private");  
+
+// Números usados para responder a solicitações Get
+int changingNumber = 1;
+int settableNumber = 0;
+uint32_t tensOfMillisCounter = 0;
+
+// Dados arbitrários serão armazenados aqui para atuar como um tipo de dado OPAQUE
+uint8_t* stuff = nullptr;
+
+// Se quisermos mudar a funcionalidade de um OID callback mais tarde, armazene-os aqui.
+ValueCallback* changingNumberOID = nullptr;
+ValueCallback* settableNumberOID = nullptr;
+ValueCallback* buttonStatusOID = nullptr;
+TimestampCallback* timestampCallbackOID = nullptr;
+
+std::string staticString = "This value will never change";
+
+// Configurar um SNMPTrap para uso posterior
+SNMPTrap* settableNumberTrap = new SNMPTrap("public", SNMP_VERSION_2C);
+char* changingString = nullptr;
+
+void setupWiFi() {
+    WiFi.begin(ssid, password);
+    Serial.println("");
+
+    // Aguarde a conexão
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    } 
+    Serial.println("");
+    Serial.print("Connected to ");
+    Serial.println(ssid);
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+}
+
+void handleRoot() {
+    String estadoBotao = (digitalRead(BUTTON_PIN) == LOW) ? "Pressionado" : "Aberto";
+    String estadoLED = (changingString != nullptr && *changingString == '1') ? "Ligado" : "Desligado";
+    size_t freeHeap = ESP.getFreeHeap();
+
+  String html = "<html><head><meta charset='UTF-8'>";
+  html += "<meta http-equiv='refresh' content='2'>";
+  html += "<script>setTimeout(function() { location.reload(); }, 2000);</script>";
+  html += "</head><body>";
+  html += "<h1>Estado do Sistema</h1>";
+  html += "<p>Temperatura: " + String(temperatura) + " °C</p>";
+  html += "<p>Umidade: " + String(umidade) + " %</p>";
+  html += "<p>Estado do botão: " + estadoBotao + "</p>";
+  html += "<p>Estado do LED: " + String(estadoLED) + "</p>";
+  html += "<p>Memória livre: " + String(freeHeap) + " bytes</p>";
+  html += "</body></html>";
+
+  server.send(200, "text/html", html);  // Envia a resposta HTTP com a página HTML
+}
+
+void setupSNMP() {
+    // Dê ao snmp um ponteiro para o objeto UDP
+    snmp.setUDP(&udp);
+    snmp.begin();
+
+    // Configurar nosso tipo de dado OPAQUE
+    stuff = (uint8_t*)malloc(4);
+    if (stuff == nullptr) {
+        Serial.println("Failed to allocate memory for stuff");
+        return;
+    }
+    stuff[0] = 1;
+    stuff[1] = 2;
+    stuff[2] = 24;
+    stuff[3] = 67;
+
+    // Adicionar 'callback' para um OID - ponteiro para um inteiro
+    changingNumberOID = snmp.addIntegerHandler(".1.3.6.1.4.1.4.0", &changingNumber);
+    settableNumberOID = snmp.addIntegerHandler(".1.3.6.1.4.1.5.1", &settableNumber, true);
+    buttonStatusOID = snmp.addIntegerHandler(".1.3.6.1.4.1.6.1", &buttonStatus);  // Novo OID para o estado do botão
+
+    snmp.addOpaqueHandler(".1.3.6.1.4.1.5.9", stuff, 4, true);
+    snmp.addReadOnlyStaticStringHandler(".1.3.6.1.4.1.5.11", staticString);
+
+    // Configurar string de leitura/escrita
+    changingString = (char*)malloc(25 * sizeof(char));
+    if (changingString == nullptr) {
+        Serial.println("Failed to allocate memory for changingString");
+        return;
+    }
+    snprintf(changingString, 25, "This is changeable");
+    snmp.addReadWriteStringHandler(".1.3.6.1.4.1.5.12", &changingString, 25, true);
+
+    // Configurar SNMP TRAP
+    timestampCallbackOID = (TimestampCallback*)snmp.addTimestampHandler(".1.3.6.1.2.1.1.3.0", &tensOfMillisCounter);
+
+    settableNumberTrap->setUDP(&udp);
+    settableNumberTrap->setTrapOID(new OIDType(".1.3.6.1.2.1.33.2"));
+    settableNumberTrap->setSpecificTrap(1);
+    settableNumberTrap->setUptimeCallback(timestampCallbackOID);
+    settableNumberTrap->addOIDPointer(changingNumberOID);
+    settableNumberTrap->addOIDPointer(settableNumberOID);
+    settableNumberTrap->setIP(WiFi.localIP());
+
+    snmp.sortHandlers();
+}
+
+void setup() {
+    Serial.begin(115200);
+    setupWiFi();
+    setupSNMP();
+    dht.begin();  // Inicializar o sensor DHT
+    pinMode(BUTTON_PIN, INPUT_PULLUP);  // Configurar o pino do botão como entrada com pull-up interno
+    pinMode(LED_PIN, OUTPUT);   // pino do Led definido como
+
+    // Configura rotas para o servidor web
+    server.on("/", handleRoot);
+    server.begin();
+    Serial.println("Servidor HTTP inicializado");
+
+    // Configura os handlers SNMP uma única vez
+    
+    buttonStatusOID = snmp.addIntegerHandler(".1.3.6.1.4.1.6.1", &buttonStatus);
+    changingNumberOID = snmp.addIntegerHandler(".1.3.6.1.4.1.5.0", &temperaturaInt);
+
+
+// Atualizar o OID com o novo valor de temperatura
+    if (changingNumberOID != nullptr) {
+        snmp.removeHandler(changingNumberOID);
+        changingNumberOID = snmp.addIntegerHandler(".1.3.6.1.4.1.5.0", &temperaturaInt);
+    }
+
+    // Ler o estado do botão e atualizar o OID
+    buttonStatus = (digitalRead(BUTTON_PIN) == LOW) ? 1 : 0;
+    if (buttonStatusOID != nullptr) {
+        snmp.removeHandler(buttonStatusOID);
+        buttonStatusOID = snmp.addIntegerHandler(".1.3.6.1.4.1.6.1", &buttonStatus);
+    }
+
+    }
+
+
+    void controlarLED() {
+    if (changingString != nullptr) {
+        if (*changingString == '1') {
+            digitalWrite(LED_PIN, HIGH);  // Liga o LED
+            Serial.println("LED ligado via SNMP");
+        } else if (*changingString == '0') {
+            digitalWrite(LED_PIN, LOW);   // Desliga o LED
+            Serial.println("LED desligado via SNMP");
+        }
+    }
+}
+
+void loop() {
+
+  controlarLED();
+ 
+    temperatura = dht.readTemperature();  // Realiza a leitura da temperatura
+    delay(500);
+    umidade = dht.readHumidity();  // Realiza a leitura da umidade
+    buttonStatus = (digitalRead(BUTTON_PIN) == LOW) ? 1 : 0;
+    
+    if (isnan(temperatura) || isnan(umidade)) {
+        Serial.println("Failed to read from DHT sensor!");
+        return;
+    }
+
+    temperaturaInt = static_cast<int>(temperatura);  // Converte valor float para inteiro
+    Serial.print("Temperatura: ");
+    Serial.println(temperatura);  // Imprime no monitor serial o valor da temperatura lida
+    Serial.print("TemperaturaInt: ");
+    Serial.print(temperaturaInt);  // Imprime no monitor serial o valor da temperatura com valor inteiro
+    Serial.println(" ºC");
+    Serial.print("Umidade: ");
+    Serial.print(umidade);  // Imprime no monitor serial o valor da umidade lida
+    Serial.println(" %");
+    Serial.print("valor da string  ");
+    Serial.println(changingString);
+    
+
+    snmp.loop();  // Deve ser chamado com a maior frequência possível
+
+    if (settableNumberOID->setOccurred) {
+        Serial.printf("Number has been set to value: %i\n", settableNumber);
+        if (settableNumber % 2 == 0) {
+            settableNumberTrap->setVersion(SNMP_VERSION_2C);
+            settableNumberTrap->setInform(true);
+        } else {
+            settableNumberTrap->setVersion(SNMP_VERSION_1);
+            settableNumberTrap->setInform(false);
+        }
+        settableNumberOID->resetSetOccurred();
+
+        IPAddress destinationIP(192, 168, 1, 243);
+        if (snmp.sendTrapTo(settableNumberTrap, destinationIP, true, 2, 5000) != INVALID_SNMP_REQUEST_ID) { 
+            Serial.println("Sent SNMP Trap");
+        } else {
+            Serial.println("Couldn't send SNMP Trap");
+        }
+    }
+
+    changingNumber++;
+    tensOfMillisCounter = millis() / 10;
+    
+
+    server.handleClient();  // Trata as requisições HTTP
+}
